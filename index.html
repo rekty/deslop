@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Deslop — find the LLM voice, then take it out</title>
+    <meta
+      name="description"
+      content="Paste a draft, see every tell that makes it read like a model wrote it, and rewrite it in a plainer voice. Readers pay with their own Pollen."
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23101116'/%3E%3Cpath d='M14 20h36M14 32h26M14 44h18' stroke='%236f5dff' stroke-width='5' stroke-linecap='round'/%3E%3Ccircle cx='48' cy='44' r='7' fill='%2327d4cd'/%3E%3C/svg%3E"
+    />
+    <style>
+      :root {
+        color-scheme: dark;
+        --ink: #f3f3f7;
+        --muted: #a2a2b0;
+        --line: rgba(255, 255, 255, 0.13);
+        --card: #1a1b21;
+        --violet: #6f5dff;
+        --cyan: #27d4cd;
+        --bad: #ff8f80;
+        --warn: #ffc46b;
+        --ok: #74ff9e;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 34px 20px 70px;
+        background:
+          radial-gradient(820px 380px at 88% -8%, rgba(111, 93, 255, 0.2), transparent 70%),
+          radial-gradient(700px 340px at 4% 0%, rgba(39, 212, 205, 0.12), transparent 70%),
+          #101014;
+        color: var(--ink);
+        font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main {
+        max-width: 1080px;
+        margin: 0 auto;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 18px;
+        margin-bottom: 22px;
+      }
+      h1 {
+        margin: 0 0 6px;
+        font-size: clamp(27px, 3.4vw, 38px);
+        letter-spacing: -0.02em;
+      }
+      .lede {
+        margin: 0;
+        max-width: 62ch;
+        color: #d5d5de;
+      }
+      .auth {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-width: 236px;
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--card);
+        font-size: 13px;
+      }
+      .auth .code {
+        font: 600 17px/1.2 ui-monospace, Menlo, monospace;
+        letter-spacing: 0.16em;
+      }
+      .grid {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: 1fr;
+      }
+      @media (min-width: 900px) {
+        .grid {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+      section.panel {
+        padding: 18px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--card);
+      }
+      section.panel h2 {
+        margin: 0 0 4px;
+        font-size: 15px;
+      }
+      .hint {
+        margin: 0 0 12px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      textarea {
+        width: 100%;
+        min-height: 240px;
+        padding: 12px;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: #131319;
+        color: var(--ink);
+        font: 15px/1.65 inherit;
+        resize: vertical;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+        margin-top: 10px;
+      }
+      button.act {
+        padding: 9px 15px;
+        border-radius: 9px;
+        border: 1px solid var(--line);
+        background: #24242b;
+        color: var(--ink);
+        font: inherit;
+        cursor: pointer;
+      }
+      button.act.primary {
+        border: 0;
+        font-weight: 600;
+        color: #0d0d16;
+        background: linear-gradient(95deg, var(--violet), var(--cyan));
+      }
+      button.act:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+      .link {
+        padding: 0;
+        border: 0;
+        background: none;
+        color: var(--cyan);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+        text-decoration: underline;
+      }
+      .counter {
+        margin-left: auto;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .score {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin-top: 14px;
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: #131319;
+      }
+      .score .num {
+        flex: 0 0 auto;
+        width: 62px;
+        text-align: center;
+        font: 700 30px/1 ui-monospace, Menlo, monospace;
+      }
+      .score .num::after {
+        content: "/100";
+        display: block;
+        margin-top: 4px;
+        font: 500 11px/1 system-ui, sans-serif;
+        color: var(--muted);
+      }
+      .score strong {
+        display: block;
+        font-size: 14px;
+      }
+      .score .hint {
+        margin: 2px 0 0;
+      }
+      .tone-bad .num {
+        color: var(--bad);
+      }
+      .tone-warn .num {
+        color: var(--warn);
+      }
+      .tone-ok .num {
+        color: var(--ok);
+      }
+      ul.tells {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        max-height: 300px;
+        overflow: auto;
+      }
+      ul.tells li {
+        padding: 9px 11px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        background: #131319;
+      }
+      ul.tells .what {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+      ul.tells .times {
+        color: var(--cyan);
+        font: 600 13px/1.4 ui-monospace, Menlo, monospace;
+      }
+      ul.tells .why,
+      ul.tells .sample {
+        margin: 3px 0 0;
+        color: var(--muted);
+        font-size: 12.5px;
+      }
+      ul.tells .sample {
+        color: #c9c9d6;
+        font-style: italic;
+      }
+      .empty {
+        margin: 0;
+        padding: 12px;
+        border: 1px dashed rgba(255, 255, 255, 0.18);
+        border-radius: 9px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .status {
+        margin: 10px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+        min-height: 20px;
+      }
+      .status.bad {
+        color: var(--bad);
+      }
+      .out {
+        margin-top: 12px;
+        padding: 12px 14px;
+        border-left: 3px solid var(--cyan);
+        border-radius: 9px;
+        background: #12161a;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 15px;
+        min-height: 60px;
+      }
+      .out:empty {
+        display: none;
+      }
+      select {
+        padding: 8px 10px;
+        border-radius: 9px;
+        border: 1px solid var(--line);
+        background: #24242b;
+        color: var(--ink);
+        font: inherit;
+        max-width: 100%;
+      }
+      footer {
+        margin-top: 34px;
+        padding-top: 16px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 13px;
+      }
+      footer img {
+        display: block;
+        width: 172px;
+        margin-bottom: 10px;
+      }
+      [hidden] {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Deslop</h1>
+          <p class="lede">
+            Paste a draft. Deslop names every tell that makes it read like a model wrote it, scores
+            the whole thing, then rewrites it in a plainer voice. The scan is local and free; the
+            rewrite spends your own Pollen.
+          </p>
+        </div>
+        <div class="auth">
+          <strong id="auth-title">Not connected</strong>
+          <span id="auth-note" class="hint" style="margin: 0">
+            The scan works without signing in. Only the rewrite needs Pollen.
+          </span>
+          <div id="auth-device" hidden>
+            <div class="code" id="auth-code"></div>
+            <button class="link" id="auth-open">Open the approval page</button>
+          </div>
+          <div class="row" style="margin-top: 0">
+            <button class="act" id="auth-connect">Connect Pollen</button>
+            <button class="act" id="auth-out" hidden>Disconnect</button>
+          </div>
+          <details>
+            <summary style="cursor: pointer">Already have an sk_ key?</summary>
+            <textarea
+              id="auth-key"
+              placeholder="sk_…"
+              style="min-height: 40px; margin-top: 8px"
+            ></textarea>
+            <button class="link" id="auth-use">Use this key</button>
+          </details>
+        </div>
+      </header>
+
+      <div class="grid">
+        <section class="panel">
+          <h2>1. Your draft</h2>
+          <p class="hint">
+            Every tell is a pattern over the text, so the same draft always scores the same. Nothing
+            here leaves the tab.
+          </p>
+          <textarea id="draft" placeholder="Paste a paragraph you suspect of sounding like a model…"></textarea>
+          <div class="row">
+            <button class="act" id="sample">Load a sample</button>
+            <button class="act" id="clear">Clear</button>
+            <span class="counter" id="count">0 words</span>
+          </div>
+
+          <div class="score tone-ok" id="score-card">
+            <div class="num" id="score">0</div>
+            <div>
+              <strong id="verdict">Nothing to scan yet</strong>
+              <p class="hint" id="score-note">Paste text and the tells appear below.</p>
+            </div>
+          </div>
+
+          <h2 style="margin-top: 18px">Tells found</h2>
+          <p class="hint" id="tells-note">Ordered by how much each one drags the score up.</p>
+          <ul class="tells" id="tells"></ul>
+        </section>
+
+        <section class="panel">
+          <h2>2. Without the tells</h2>
+          <p class="hint">
+            Same facts, plainer voice. The second score is the rewrite measured by the same rules.
+          </p>
+          <div class="row" style="margin-top: 0">
+            <select id="model" aria-label="Model"></select>
+            <button class="act primary" id="go">Deslop it</button>
+          </div>
+          <p class="status" id="status"></p>
+
+          <div class="score tone-ok" id="after-card" hidden>
+            <div class="num" id="after-score">0</div>
+            <div>
+              <strong id="after-verdict"></strong>
+              <p class="hint" id="after-note"></p>
+            </div>
+          </div>
+
+          <div class="out" id="out"></div>
+          <div class="row">
+            <button class="act" id="copy" hidden>Copy</button>
+            <button class="act" id="use" hidden>Use as my draft</button>
+          </div>
+        </section>
+      </div>
+
+      <footer>
+        <a href="https://pollinations.ai/?ref=badge">
+          <img
+            src="https://raw.githubusercontent.com/pollinations/pollinations/main/packages/ui/src/brand/badge-made-with.svg"
+            alt="Made with pollinations.ai"
+          />
+        </a>
+        <p>
+          The scan runs in this tab and costs nothing. Only when you press <em>Deslop it</em> is your
+          draft sent to Pollinations, on a key the app got from you through the device flow; the key
+          lives in <code>sessionStorage</code> and dies with the tab. Model choice, budget and
+          revocation stay in your own account.
+        </p>
+      </footer>
+    </main>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

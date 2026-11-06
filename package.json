@@ -1,0 +1,6 @@
+{
+  "name": "deslop",
+  "private": true,
+  "type": "module",
+  "description": "Find the LLM voice in a draft, then take it out. Static page, no build step."
+}
