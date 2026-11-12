@@ -12,6 +12,10 @@ import {
   isVerifiedModel,
   VERIFIED_MODELS,
   STRICT_RETRY,
+  qualityRetryPrompt,
+  nextAttempt,
+  pickBest,
+  MAX_ATTEMPTS,
 } from "../shared/detect.js";
 
 const SLOP = `In today's fast-paced world, writing has become a tapestry of tools and techniques. Language models don't just generate text—they produce a voice, a rhythm, a signature. It is important to note that this voice is not merely a stylistic choice but a window into the model's training. Furthermore, these models leverage vast datasets to deliver seamless, robust, and holistic output. Let's dive into why this matters. On one hand, the voice is useful; on the other hand, it can be exhausting. Ultimately, the key takeaway is that removing the LLM voice is crucial for authentic communication. In conclusion, it is worth noting that deliberate revision, careful attention, and honest editing can unlock a more human tone.`;
@@ -165,14 +169,23 @@ test("rewrite refuses to run without a prompt", async () => {
 const SLOP_DRAFT = "In today's fast-paced world, this is not just a tool but a tapestry of seamless, robust, and holistic output. It is important to note that we delve into the landscape. I hope this helps!";
 
 test("a rewrite that barely improves triggers one quality retry and keeps the better text", async () => {
+  const prompt = "Draft: " + SLOP_DRAFT;
   const fake = answer([plain(SLOP_DRAFT), plain("We tried the tool on Tuesday. It worked.")]);
-  const before = analyze(SLOP_DRAFT).score;
-  const out = await rewriteWithRetry({ send: fake.send, prompt: "Draft: " + SLOP_DRAFT, beforeScore: before });
+  const before = analyze(SLOP_DRAFT);
+  const out = await rewriteWithRetry({ send: fake.send, prompt, beforeScore: before.score });
+
   assert.equal(fake.prompts.length, 2);
   assert.equal(out.qualityRetry, true);
-  assert.match(fake.prompts[1], /still reads like a model wrote it|copies|Earlier answer was not JSON|Wrong shape/i);
-  assert.ok(out.text.length > 0);
-  assert.ok(out.scores.filter((s) => s != null).length >= 2);
+  assert.deepEqual(out.reasons, ["first", "quality"]);
+
+  const retry = fake.prompts[1];
+  assert.ok(retry.startsWith(prompt), "the quality retry keeps the original brief");
+  assert.ok(retry.includes(STRICT_RETRY), "it repeats the no-wrapper instruction verbatim");
+  assert.ok(retry.includes("Your rewrite still reads like a model wrote it"), "it says why it is asking again");
+  assert.ok(retry.includes("Do not reuse any sentence"), "it forbids copying the draft");
+  assert.ok(retry.includes(before.hits[0].label), `it names the surviving tell: ${before.hits[0].label}`);
+  assert.ok(!/Earlier answer was not JSON|Wrong shape/i.test(retry), "no borrowed line from another app's retry");
+  assert.equal(out.text, "We tried the tool on Tuesday. It worked.", "the better attempt wins");
 });
 
 test("a rewrite that already drops the score is not retried for quality", async () => {
@@ -180,6 +193,47 @@ test("a rewrite that already drops the score is not retried for quality", async 
   const out = await rewriteWithRetry({ send: fake.send, prompt: "Draft: " + SLOP_DRAFT, beforeScore: 95 });
   assert.equal(fake.prompts.length, 1, "no second call when the improvement is already there");
   assert.equal(out.qualityRetry, false);
+});
+
+test("a wrapped first answer still gets one quality retry when the score did not move", async () => {
+  const fake = answer([fenced(SLOP_DRAFT), plain(SLOP_DRAFT), plain("We tried it. It worked.")]);
+  const before = analyze(SLOP_DRAFT).score;
+  const out = await rewriteWithRetry({ send: fake.send, prompt: "Draft: x", beforeScore: before });
+  assert.equal(fake.prompts.length, 3, "wrapper retry, then quality retry, then stop");
+  assert.deepEqual(out.reasons, ["first", "wrapper", "quality"]);
+  assert.equal(out.recovered, true);
+  assert.equal(out.qualityRetry, true);
+  assert.equal(out.text, "We tried it. It worked.");
+});
+
+test("nextAttempt stops for the right reason every time", () => {
+  const plainOk = (score, reason = "first") => ({ reason, text: "x", wrapped: false, score, hits: [] });
+  const wrapped = (reason = "first") => ({ reason, text: "x", wrapped: true, score: 90, hits: [] });
+
+  assert.equal(nextAttempt([]), null, "nothing to continue from");
+  assert.equal(nextAttempt([plainOk(90)], { beforeScore: null })?.reason ?? null, null, "no before-score, no quality retry");
+  assert.equal(nextAttempt([plainOk(10)], { beforeScore: 90 })?.reason ?? null, null, "a big drop needs no retry");
+  assert.equal(nextAttempt([plainOk(90), plainOk(90, "quality")], { beforeScore: 90 })?.reason ?? null, null, "quality is spent once");
+  assert.equal(nextAttempt([wrapped("wrapper")])?.reason ?? null, null, "a wrapped retry ends the road");
+  assert.equal(nextAttempt([plainOk(90), plainOk(90), plainOk(90)], { beforeScore: 90, maxAttempts: 3 })?.reason ?? null, null, "the attempt cap wins");
+  assert.equal(nextAttempt([plainOk(90)], { beforeScore: 90 }).reason, "quality");
+  assert.equal(nextAttempt([wrapped()], { beforeScore: 90 }).reason, "wrapper");
+});
+
+test("pickBest prefers a clean answer over a lower-scoring wrapped one", () => {
+  const best = pickBest([
+    { text: "wrapped text", wrapped: true, score: 5 },
+    { text: "clean text", wrapped: false, score: 60 },
+  ]);
+  assert.equal(best.text, "clean text");
+  assert.equal(MAX_ATTEMPTS, 3);
+  assert.equal(pickBest([{ text: "a", wrapped: false, score: 70 }, { text: "b", wrapped: false, score: 20 }]).text, "b");
+});
+
+test("qualityRetryPrompt is built from the surviving tells, not a fixed sentence", () => {
+  const withTells = qualityRetryPrompt(["delve", "tapestry"]);
+  assert.ok(withTells.includes("delve, tapestry"));
+  assert.ok(qualityRetryPrompt([]).includes("the same model tics"));
 });
 
 test("the measured models are the two that were actually verified", () => {

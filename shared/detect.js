@@ -363,40 +363,85 @@ export function qualityRetryPrompt(remaining) {
  * the attempts is returned, measured by the same rules that scored the draft.
  * `send(prompt)` is injected, so the whole policy is testable without a network call.
  */
-export async function rewriteWithRetry({ send, prompt, beforeScore = null, minDrop = 25 }) {
+export const MAX_ATTEMPTS = 3;
+
+/** Prefer an unwrapped answer, then the lowest score: the cleanest text the reader paid for. */
+export function pickBest(attempts) {
+  const usable = attempts.filter((attempt) => attempt.text);
+  const list = usable.length ? usable : attempts;
+  return [...list].sort(
+    (a, b) => Number(a.wrapped) - Number(b.wrapped) || (a.score ?? Infinity) - (b.score ?? Infinity),
+  )[0];
+}
+
+/**
+ * One place that answers "is another attempt worth the reader's Pollen?":
+ * - a wrapped answer gets one strict retry, but a wrapped retry is the end of the road;
+ * - a clean answer that barely moved the score gets one quality retry;
+ * - never more than `maxAttempts` calls, whatever the flags say.
+ */
+export function nextAttempt(attempts, { beforeScore = null, minDrop = 25, maxAttempts = MAX_ATTEMPTS } = {}) {
+  if (!attempts.length || attempts.length >= maxAttempts) return null;
+
+  const last = attempts[attempts.length - 1];
+  const reasons = attempts.map((attempt) => attempt.reason);
+
+  if (last.wrapped) {
+    return reasons.includes("wrapper") ? null : { reason: "wrapper", prompt: STRICT_RETRY };
+  }
+  if (beforeScore == null || reasons.includes("quality")) return null;
+
+  const best = pickBest(attempts);
+  if (best.score == null || beforeScore - best.score >= minDrop) return null;
+
+  const remaining = (best.hits || []).map((hit) => hit.label).slice(0, 5);
+  return { reason: "quality", prompt: qualityRetryPrompt(remaining) };
+}
+
+/**
+ * Ask, clean, measure, repeat while `nextAttempt()` says it is worth it, then keep the
+ * best attempt. `send(prompt)` is injected so the whole policy is testable offline.
+ */
+export async function rewriteWithRetry({ send, prompt, beforeScore = null, minDrop = 25, maxAttempts = MAX_ATTEMPTS }) {
   if (typeof prompt !== "string" || !prompt.trim()) throw new Error("rewrite needs a prompt");
 
   const attempts = [];
-  const round = async (text) => {
-    const raw = await send(text);
-    const cleaned = cleanRewrite(raw);
-    const result = cleaned ? analyze(cleaned) : null;
-    return { raw, text: cleaned, wrapped: isWrapped(raw, cleaned), score: result ? result.score : null, hits: result ? result.hits : [] };
-  };
+  let reason = "first";
+  let instruction = null;
 
-  attempts.push(await round(prompt));
-  const wrapperRetry = attempts[0].wrapped;
-  if (wrapperRetry) attempts.push(await round(`${prompt}\n\n${STRICT_RETRY}`));
+  while (attempts.length < maxAttempts) {
+    const raw = await send(instruction ? `${prompt}\n\n${instruction}` : prompt);
+    const text = cleanRewrite(raw);
+    const scan = text ? analyze(text) : null;
+    attempts.push({
+      reason,
+      raw,
+      text,
+      wrapped: isWrapped(raw, text),
+      score: scan ? scan.score : null,
+      hits: scan ? scan.hits : [],
+    });
 
-  const bestOf = (list) => list.filter((a) => a.text).sort((a, b) => (a.score ?? 100) - (b.score ?? 100))[0] || list[0];
-  let best = bestOf(attempts);
-
-  const qualityRetry =
-    beforeScore != null && best.score != null && beforeScore - best.score < minDrop && attempts.length < 3;
-  if (qualityRetry) {
-    const remaining = (best.hits || []).map((hit) => hit.label).slice(0, 5);
-    attempts.push(await round(`${prompt}\n\n${qualityRetryPrompt(remaining)}`));
-    best = bestOf(attempts);
+    const step = nextAttempt(attempts, { beforeScore, minDrop, maxAttempts });
+    if (!step) break;
+    reason = step.reason;
+    instruction = step.prompt;
   }
+
+  const best = pickBest(attempts);
+  const reasons = attempts.map((attempt) => attempt.reason);
+  const wrapperRetried = reasons.includes("wrapper");
 
   return {
     text: best.text,
     raw: best.raw,
     attempts: attempts.length,
-    retryFailed: wrapperRetry && attempts[1].wrapped && attempts.every((a) => a.wrapped),
-    recovered: wrapperRetry && !attempts[1].wrapped,
-    qualityRetry,
-    scores: attempts.map((a) => a.score),
+    scores: attempts.map((attempt) => attempt.score),
+    reasons,
+    bestReason: best.reason,
+    recovered: wrapperRetried && attempts.some((attempt) => attempt.reason === "wrapper" && !attempt.wrapped),
+    retryFailed: wrapperRetried && attempts.every((attempt) => attempt.wrapped),
+    qualityRetry: reasons.includes("quality"),
   };
 }
 
