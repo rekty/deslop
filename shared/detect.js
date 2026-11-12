@@ -306,6 +306,110 @@ export function analyze(text) {
   };
 }
 
+// Models measured against this app's own rewrite prompt. A model that answers with
+// a preamble or a code fence costs the reader Pollen and still needs cleaning, so the
+// picker says which ones were actually checked.
+export const REWRITE_SYSTEM = [
+  "You remove the LLM voice from a draft: the recognisable style of prose written by language models.",
+  "Keep every fact, name, number, claim and any Markdown structure. Keep the length within about fifteen percent. Add nothing new.",
+  "The passage between the DRAFT markers is the only text to rewrite. Never repeat the instruction, the list of tells or the markers in your answer.",
+  'Drop these constructions when they appear: "not just X, but Y", "not only … but also", rule-of-three lists that only pad, em dashes used as commas, "delve", "tapestry", "testament", "in today\'s fast-paced world", "let\'s dive in", "it is important to note", "in conclusion", "the key takeaway", "serves as", and marketing verbs such as journey, unlock, elevate, supercharge.',
+  "Do not reuse a sentence from the draft: only facts, names and numbers carry over. Write it again, shorter and plainer.",
+  "Do not add an opening line, a closing summary or any commentary about the rewrite. Vary sentence length. Prefer concrete nouns and active verbs.",
+  "Reply with the rewritten text only.",
+].join(" ");
+
+export const VERIFIED_MODELS = ["openai/gpt-5.4-nano", "z-ai/glm-5.3-flash"];
+
+export function isVerifiedModel(id) {
+  return VERIFIED_MODELS.includes(String(id || ""));
+}
+
+/** Strip what a chat model adds around a rewrite: fences, a preamble line, stray quotes. */
+export function cleanRewrite(text) {
+  let out = String(text == null ? "" : text).replace(/\r/g, "").trim();
+  out = out.replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "").trim();
+  // Models like to echo the brief they were given. Drop a leading restatement.
+  out = out.replace(
+    /^(?:a local check found|the local check found|tells found|the draft (?:currently )?shows|known tells|draft)\b[^\n]*\n+/i,
+    "",
+  );
+  out = out.replace(/^(?:rewrite(?:d)? (?:the|this) (?:draft|passage)[^\n]*\n+)/i, "");
+  out = out.replace(/^<<<DRAFT\s*\n?/i, "").replace(/\n?DRAFT>>>$/i, "").trim();
+  out = out.replace(/^(?:here(?:'s| is) (?:the )?(?:rewrit(?:e|ten)[a-z ]*|version)[^:\n]*:\s*)/i, "").trim();
+  out = out.replace(/^(?:rewritten(?: text| version)?\s*[-—:]\s*)/i, "").trim();
+  const quoted = /^"([\s\S]*)"$/.exec(out) || /^“([\s\S]*)”$/.exec(out);
+  if (quoted && quoted[1].length > 40) out = quoted[1].trim();
+  return out;
+}
+
+export const STRICT_RETRY =
+  "That answer added text around the rewrite. Reply again with only the rewritten passage: no preamble, no fence, no quotes around it, no commentary.";
+
+/** Second-quality attempt: name what survived and forbid copying the draft. */
+export function qualityRetryPrompt(remaining) {
+  const list = remaining.length ? remaining.join(", ") : "the same model tics";
+  return [
+    STRICT_RETRY,
+    `Your rewrite still reads like a model wrote it: it kept ${list}.`,
+    "Write it again from scratch. Do not reuse any sentence from the draft or from your last answer — only the facts, names and numbers carry over.",
+    "Short sentences are allowed. So are plain words.",
+  ].join(" ");
+}
+
+/**
+ * Run the rewrite, clean it, retry once when the model wraps its answer, and — when a
+ * before-score is given — retry once more if the result barely improved. The best of
+ * the attempts is returned, measured by the same rules that scored the draft.
+ * `send(prompt)` is injected, so the whole policy is testable without a network call.
+ */
+export async function rewriteWithRetry({ send, prompt, beforeScore = null, minDrop = 25 }) {
+  if (typeof prompt !== "string" || !prompt.trim()) throw new Error("rewrite needs a prompt");
+
+  const attempts = [];
+  const round = async (text) => {
+    const raw = await send(text);
+    const cleaned = cleanRewrite(raw);
+    const result = cleaned ? analyze(cleaned) : null;
+    return { raw, text: cleaned, wrapped: isWrapped(raw, cleaned), score: result ? result.score : null, hits: result ? result.hits : [] };
+  };
+
+  attempts.push(await round(prompt));
+  const wrapperRetry = attempts[0].wrapped;
+  if (wrapperRetry) attempts.push(await round(`${prompt}\n\n${STRICT_RETRY}`));
+
+  const bestOf = (list) => list.filter((a) => a.text).sort((a, b) => (a.score ?? 100) - (b.score ?? 100))[0] || list[0];
+  let best = bestOf(attempts);
+
+  const qualityRetry =
+    beforeScore != null && best.score != null && beforeScore - best.score < minDrop && attempts.length < 3;
+  if (qualityRetry) {
+    const remaining = (best.hits || []).map((hit) => hit.label).slice(0, 5);
+    attempts.push(await round(`${prompt}\n\n${qualityRetryPrompt(remaining)}`));
+    best = bestOf(attempts);
+  }
+
+  return {
+    text: best.text,
+    raw: best.raw,
+    attempts: attempts.length,
+    retryFailed: wrapperRetry && attempts[1].wrapped && attempts.every((a) => a.wrapped),
+    recovered: wrapperRetry && !attempts[1].wrapped,
+    qualityRetry,
+    scores: attempts.map((a) => a.score),
+  };
+}
+
+/** Did the model wrap the passage in commentary we had to cut away? */
+export function isWrapped(raw, cleaned) {
+  const source = String(raw || "").trim();
+  if (!source) return false;
+  if (/```/.test(source)) return true;
+  if (/^(?:here(?:'s| is)|sure|certainly|of course|rewritten)/i.test(source)) return true;
+  const cut = source.length - String(cleaned || "").length;
+  return cut > 24;
+}
+
 export function verdict(score) {
   if (score >= 70) return { tone: "bad", label: "Reads like a model wrote it" };
   if (score >= 40) return { tone: "warn", label: "Model habits are showing" };

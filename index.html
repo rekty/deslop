@@ -236,6 +236,17 @@
         color: var(--muted);
         font-size: 13px;
       }
+      .modelnote {
+        margin: 8px 0 0;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .modelnote[data-state="ok"] {
+        color: var(--ok, #7dcf9a);
+      }
+      .modelnote[data-state="warn"] {
+        color: var(--warn, #e8b45c);
+      }
       .status {
         margin: 10px 0 0;
         color: var(--muted);
@@ -357,6 +368,7 @@
             <select id="model" aria-label="Model"></select>
             <button class="act primary" id="go">Deslop it</button>
           </div>
+          <p class="modelnote" id="model-note"></p>
           <p class="status" id="status"></p>
 
           <div class="score tone-ok" id="after-card" hidden>

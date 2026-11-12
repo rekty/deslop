@@ -1,4 +1,4 @@
-import { analyze, countWords, verdict } from "./shared/detect.js";
+import { analyze, countWords, verdict, rewriteWithRetry, isVerifiedModel, VERIFIED_MODELS, REWRITE_SYSTEM } from "./shared/detect.js";
 import { createPollen, DEFAULT_MODEL, ENDPOINTS } from "./shared/pollen.js";
 
 const $ = (id) => document.getElementById(id);
@@ -15,13 +15,8 @@ const state = {
 
 const SAMPLE = `In today's fast-paced world, writing has become a tapestry of tools and techniques. Language models don't just generate text—they produce a voice, a rhythm, a signature. It is important to note that this voice is not merely a stylistic choice but a window into the model's training. Furthermore, these models leverage vast datasets to deliver seamless, robust, and holistic output. Let's dive into why this matters. On one hand, the voice is useful; on the other hand, it can be exhausting. Ultimately, the key takeaway is that removing the LLM voice is crucial for authentic communication. In conclusion, it is worth noting that deliberate revision, careful attention, and honest editing can unlock a more human tone.`;
 
-const SYSTEM = [
-  "You remove the LLM voice from a draft: the recognisable style of prose written by language models.",
-  "Keep every fact, name, number, claim and any Markdown structure. Keep the length within about fifteen percent. Add nothing new.",
-  'Drop these constructions when they appear: "not just X, but Y", "not only … but also", rule-of-three lists that only pad, em dashes used as commas, "delve", "tapestry", "testament", "in today\'s fast-paced world", "let\'s dive in", "it is important to note", "in conclusion", "the key takeaway", "serves as", and marketing verbs such as journey, unlock, elevate, supercharge.',
-  "Do not add an opening line, a closing summary or any commentary about the rewrite. Vary sentence length. Prefer concrete nouns and active verbs.",
-  "Reply with the rewritten text only.",
-].join(" ");
+// The rewrite prompt lives in shared/detect.js so a measurement run uses exactly it.
+const SYSTEM = REWRITE_SYSTEM;
 
 function say(id, text, bad = false) {
   const element = $(id);
@@ -203,19 +198,48 @@ async function loadModels() {
       .filter((id) => typeof id === "string" && id.includes("/"))
       .slice(0, 24);
     if (!ids.includes(DEFAULT_MODEL)) ids.unshift(DEFAULT_MODEL);
-    select.replaceChildren(...ids.map((id) => new Option(id, id)));
+    const ranked = [...ids].sort((a, b) => Number(isVerifiedModel(b)) - Number(isVerifiedModel(a)));
+    select.replaceChildren(
+      ...ranked.map((id) => new Option(`${isVerifiedModel(id) ? "✓" : "⚠"} ${id}`, id)),
+    );
     select.value = DEFAULT_MODEL;
   } catch {
     /* the default is enough; a failed list must not break the page */
   }
+  modelNote();
 }
+
+/** Say whether the selected model was measured on this app's rewrite prompt. */
+function modelNote() {
+  const note = $("model-note");
+  if (!note) return;
+  const id = $("model").value || DEFAULT_MODEL;
+  if (isVerifiedModel(id)) {
+    note.textContent = "✓ measured: returns the passage in the asked shape.";
+    note.dataset.state = "ok";
+  } else {
+    note.textContent = `⚠ not measured here: may wrap the rewrite in a preamble or a fence. Verified: ${VERIFIED_MODELS.join(", ")}.`;
+    note.dataset.state = "warn";
+  }
+}
+
+$("model").addEventListener("change", modelNote);
 
 /* ---------- rewrite ---------- */
 
 function promptFor(draft, result) {
   const tells = (result?.hits ?? []).slice(0, 8).map((hit) => hit.label);
-  const note = tells.length ? `A local check found these tells: ${tells.join("; ")}.\n\n` : "";
-  return `${note}Draft:\n"""\n${draft}\n"""`;
+  return [
+    "Rewrite the draft below so it stops sounding like a language model wrote it.",
+    tells.length
+      ? `Its current tells: ${tells.join("; ")}. Do not repeat this list, this sentence or these markers in your answer.`
+      : "Do not repeat this instruction in your answer.",
+    "Only the text between the DRAFT markers is to be rewritten.",
+    "",
+    "<<<DRAFT",
+    draft,
+    "DRAFT>>>",
+  ].join("\n");
 }
 
 $("go").onclick = async () => {
@@ -234,12 +258,20 @@ $("go").onclick = async () => {
   $("after-card").hidden = true;
 
   try {
-    state.rewrite = await pollen.ask({
-      system: SYSTEM,
+    const model = $("model").value || DEFAULT_MODEL;
+    const result = await rewriteWithRetry({
       prompt: promptFor(draft, state.result),
-      model: $("model").value || DEFAULT_MODEL,
-      maxTokens: Math.max(600, Math.min(2000, Math.round(countWords(draft) * 3))),
+      beforeScore: state.result ? state.result.score : null,
+      send: (prompt) =>
+        pollen.ask({
+          system: SYSTEM,
+          prompt,
+          model,
+          maxTokens: Math.max(600, Math.min(2000, Math.round(countWords(draft) * 3))),
+        }),
     });
+    state.rewrite = result.text;
+    if (!state.rewrite) throw new Error("the model returned an empty rewrite");
 
     $("out").textContent = state.rewrite;
     $("copy").hidden = false;
@@ -258,7 +290,12 @@ $("go").onclick = async () => {
         ? `${before} → ${state.after.score}: ${delta} points of LLM voice gone.`
         : `Same tells or new ones (${before} → ${state.after.score}). Run it again or edit by hand.`;
 
-    say("status", state.after.hits.length ? `Left: ${state.after.hits.map((hit) => hit.label).slice(0, 3).join(", ")}.` : "Clean by the same rules.");
+    const notes = [];
+    if (result.recovered) notes.push("the model wrapped its answer, the retry recovered it");
+    if (result.retryFailed) notes.push("the model kept adding commentary; the wrapper was stripped in the browser");
+    if (result.qualityRetry && result.attempts > 1) notes.push(`a second attempt scored better (${result.scores.filter((s) => s != null).join(" → ")})`);
+    const left = state.after.hits.length ? `Left: ${state.after.hits.map((hit) => hit.label).slice(0, 3).join(", ")}.` : "Clean by the same rules.";
+    say("status", [left, ...notes].join(" "));
   } catch (error) {
     const message =
       error?.code === "auth"

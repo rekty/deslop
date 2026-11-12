@@ -16,6 +16,29 @@ The scan is the part that runs in your browser: a fixed list of patterns, no mod
 cost. The rewrite is one chat completion on your own Pollen. That split is deliberate — you can see
 exactly what the app thinks is wrong before you spend anything.
 
+## Measured, not assumed
+
+Run against `POST /v1/chat/completions` with this app's real system prompt and a temporary key
+(revoked after the run), using the sample draft that ships in the page:
+
+| Step | Score |
+|---|---|
+| Draft as written | **100** — "reads like a model wrote it" |
+| First attempt, old prompt | 100 — the model echoed the tell list and barely changed the prose |
+| After fixing the brief (`<<<DRAFT … DRAFT>>>`, "never repeat the list") | **15** — "reads like a person", one attempt |
+
+Two bugs that run exposed, both now guarded:
+
+- **Echoed brief.** Models copied "A local check found these tells: …" into the answer, so the score
+  never moved. The tells now sit inside an instruction the model is told not to repeat, and
+  `cleanRewrite()` strips a leading restatement, a fence, a preamble and wrapping quotes.
+- **Silent no-op rewrites.** If the reply is clean but the score barely moves, one quality retry
+  names the surviving tells and forbids reusing any sentence, then the better of the attempts wins.
+  The page prints the scores of each attempt, so a weak rewrite is visible instead of hidden.
+
+Kernel picker: `✓` marks the models measured on this exact prompt (`openai/gpt-5.4-nano`,
+`z-ai/glm-5.3-flash`); everything else is offered with `⚠`. `node --test` covers 28 cases.
+
 ## What you get
 
 - **A score, 0–100.** Points per 100 words from nineteen tells, mapped onto a band. The same draft
